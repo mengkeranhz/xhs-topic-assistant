@@ -1,0 +1,76 @@
+assistant:
+  model:
+    # Supported provider values:
+    # - openai-compatible protocol: openai, openai-compatible, generic,
+    #   glm/zhipu/bigmodel, deepseek, moonshot/kimi, qwen/dashscope/tongyi,
+    #   doubao/ark/volcengine, minimax, siliconflow
+    # - anthropic protocol: anthropic
+    provider: glm
+    openai:
+      # All OpenAI-compatible providers share this client.
+      base-url: https://open.bigmodel.cn/api/paas/v4
+      # Prefer an environment variable or fill this only in the ignored local file.
+      api-key: ${OPENAI_COMPATIBLE_API_KEY:}
+      chat-model: glm-4-plus
+      vision-model: glm-4v-plus
+
+    anthropic:
+      base-url: https://api.anthropic.com
+      api-key: ${ANTHROPIC_API_KEY:}
+      api-version: 2023-06-01
+      chat-model: claude-3-5-sonnet-latest
+      vision-model: claude-3-5-sonnet-latest
+
+    allow-offline-fallback: false
+
+  browser:
+    cdp-url: http://127.0.0.1:9222
+    search-result-limit: 100
+    detail-limit: 20
+
+  storage:
+    root: ./data
+
+# Common mainland-China OpenAI-compatible endpoints:
+#
+# GLM / Zhipu:
+#   provider: glm
+#   base-url: https://open.bigmodel.cn/api/paas/v4
+#   chat-model: glm-4-plus
+#   vision-model: glm-4v-plus
+#
+# DeepSeek:
+#   provider: deepseek
+#   base-url: https://api.deepseek.com/v1
+#   chat-model: deepseek-chat
+#   vision-model: replace-with-available-vision-model
+#
+# Kimi / Moonshot:
+#   provider: moonshot
+#   base-url: https://api.moonshot.cn/v1
+#   chat-model: moonshot-v1-8k
+#   vision-model: moonshot-v1-8k-vision-preview
+#
+# Qwen / DashScope compatible mode:
+#   provider: qwen
+#   base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+#   chat-model: qwen-plus
+#   vision-model: qwen-vl-plus
+#
+# Doubao / Volcengine Ark:
+#   provider: doubao
+#   base-url: https://ark.cn-beijing.volces.com/api/v3
+#   chat-model: your-endpoint-or-model-id
+#   vision-model: your-vision-endpoint-or-model-id
+#
+# MiniMax:
+#   provider: minimax
+#   base-url: your-platform-openai-compatible-base-url
+#   chat-model: your-text-model
+#   vision-model: your-vision-model
+#
+# SiliconFlow:
+#   provider: siliconflow
+#   base-url: https://api.siliconflow.cn/v1
+#   chat-model: your-text-model
+#   vision-model: your-vision-model

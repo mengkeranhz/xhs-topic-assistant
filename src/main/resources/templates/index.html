@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN" xmlns:th="http://www.thymeleaf.org">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title th:text="${appName}">小红书话题研究助手</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header class="app-header">
+  <div>
+    <div class="brand"><span class="brand-mark">XHS</span><strong th:text="${appName}">小红书话题研究助手</strong></div>
+    <p class="subtitle">本地 CDP 采集 · Markdown 持久化 · OpenAI / Anthropic · 有界 Agent Loop</p>
+  </div>
+  <div class="header-actions">
+    <a href="/swagger-ui.html" target="_blank" class="ghost-button">OpenAPI</a>
+    <a href="/actuator/health" target="_blank" class="ghost-button">Health</a>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="card create-card">
+      <label for="keyword">研究关键词</label>
+      <input id="keyword" placeholder="例如：Manus 2" autocomplete="off">
+      <button id="start-button" class="primary-button">开始研究</button>
+      <button id="rerun-button" class="secondary-button" disabled>再次运行</button>
+      <div id="browser-status" class="browser-status">正在检查 CDP 浏览器...</div>
+      <div id="form-message" class="form-message"></div>
+    </section>
+    <section class="card">
+      <div class="section-title">任务历史</div>
+      <div id="task-list" class="task-list"></div>
+    </section>
+    <section class="card compact">
+      <div class="section-title">能力复用</div>
+      <div class="api-hint">其他 Agent 可调用 <code>POST /api/tasks</code>，轮询 <code>GET /api/tasks/&#123;taskId&#125;</code>，完成后读取 <code>/result</code>。</div>
+    </section>
+  </aside>
+
+  <section class="workspace">
+    <section id="empty-state" class="empty-state card">
+      <div>
+        <h2>从一次提交开始</h2>
+        <p>输入关键词后，系统会自动完成外层搜索、候选清洗、相关性判断、排序、详情采集、图片 OCR、有界 Agent Loop 和 Final Answer Gate。无需逐步点击下一步。</p>
+        <div class="pill-row"><span>单浏览器串行</span><span>验证码人工处理</span><span>结果可恢复</span><span>增量比较</span></div>
+      </div>
+    </section>
+
+    <section id="task-view" class="task-view hidden">
+      <section class="status-strip card">
+        <div>
+          <div class="task-title-row"><h2 id="task-keyword"></h2><span id="task-status" class="status-pill"></span></div>
+          <div class="meta-row"><span id="task-id"></span><span id="task-created"></span><span id="task-duration"></span></div>
+        </div>
+        <div class="status-actions">
+          <button id="cancel-button" class="danger-button">取消任务</button>
+          <button id="retry-button" class="secondary-button">重试 / 恢复</button>
+        </div>
+      </section>
+      <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
+
+      <section class="metrics-grid">
+        <article class="metric-card"><span>候选池</span><strong id="metric-candidates">0</strong></article>
+        <article class="metric-card"><span>相关帖子</span><strong id="metric-relevant">0</strong></article>
+        <article class="metric-card"><span>入选 Top</span><strong id="metric-selected">0</strong></article>
+        <article class="metric-card"><span>实际分析</span><strong id="metric-analyzed">0</strong></article>
+        <article class="metric-card"><span>模型调用</span><strong id="metric-calls">0</strong></article>
+        <article class="metric-card"><span>Token</span><strong id="metric-tokens">0</strong></article>
+      </section>
+
+      <div class="content-grid">
+        <section class="card report-card">
+          <div class="card-header"><h3>综合研究报告</h3><span id="gate-pill" class="gate-pill">等待生成</span></div>
+          <div id="report" class="markdown report-body"><p>尚未生成报告。</p></div>
+        </section>
+        <div class="stack">
+          <section class="card">
+            <div class="card-header"><h3>执行过程</h3><span class="muted">SSE</span></div>
+            <div id="event-log" class="event-log"></div>
+          </section>
+          <section class="card">
+            <div class="card-header"><h3>热门帖子</h3><span id="post-count" class="muted">0</span></div>
+            <div id="post-list" class="post-list"></div>
+          </section>
+        </div>
+      </div>
+
+      <section class="card">
+        <div class="card-header"><h3>上下文追问</h3><span class="muted">仅使用当前任务材料</span></div>
+        <div class="question-form"><input id="question-input" placeholder="哪些帖子实际使用过这个产品？"><button id="ask-button" class="primary-button compact-button">提问</button></div>
+        <div id="question-list" class="question-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h3>增量比较</h3><span id="diff-summary" class="muted">尚未运行</span></div>
+        <div id="diff-content" class="diff-content">点击“再次运行”后，这里会展示新增帖子、热度变化、新观点和复用统计。</div>
+      </section>
+
+      <section class="card">
+        <div class="card-header"><h3>效率与模型用量</h3><span class="muted">Queue / Retry / Cache / Tokens</span></div>
+        <div id="metrics-content" class="metrics-content">暂无指标。</div>
+      </section>
+    </section>
+  </section>
+</main>
+<script src="/js/app.js"></script>
+</body>
+</html>

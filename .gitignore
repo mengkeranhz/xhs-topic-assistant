@@ -1,0 +1,14 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+build/
+out/
+.kotlin
+.idea/
+.vscode/
+.DS_Store
+data/
+.local/
+config/application-local.yml
+*.log

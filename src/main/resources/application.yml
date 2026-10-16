@@ -1,0 +1,69 @@
+server:
+  port: 8080
+  address: 127.0.0.1
+
+spring:
+  application:
+    name: xhs-topic-assistant
+  threads:
+    virtual:
+      enabled: true
+  web:
+    resources:
+      cache:
+        cachecontrol:
+          no-cache: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+assistant:
+  browser:
+    cdp-url: http://127.0.0.1:9222
+    visible: true
+    search-result-limit: 100
+    detail-limit: 20
+    max-images-per-post: 6
+    min-action-interval-ms: 4000
+    max-action-interval-ms: 9000
+    detail-min-interval-ms: 12000
+    detail-max-interval-ms: 25000
+    page-timeout-ms: 20000
+    max-continuous-captcha-hits: 2
+    task-timeout-seconds: 900
+  model:
+    provider: openai
+    openai:
+      base-url: https://api.openai.com/v1
+      api-key: ${OPENAI_API_KEY:}
+      chat-model: gpt-4o-mini
+      vision-model: gpt-4o-mini
+    anthropic:
+      base-url: https://api.anthropic.com
+      api-key: ${ANTHROPIC_API_KEY:}
+      api-version: 2023-06-01
+      chat-model: claude-3-5-sonnet-latest
+      vision-model: claude-3-5-sonnet-latest
+    temperature: 0.2
+    timeout-seconds: 90
+    max-concurrency: 2
+    max-calls-per-task: 80
+    max-input-tokens-per-task: 120000
+    allow-offline-fallback: true
+    max-agent-rounds: 8
+    max-tool-calls-per-round: 4
+    max-final-repairs: 2
+  storage:
+    root: ./data
+    keep-page-snapshot: true
+    max-post-raw-chars: 20000
+  incremental:
+    enabled: true
+    min-rerun-interval-seconds: 1800
