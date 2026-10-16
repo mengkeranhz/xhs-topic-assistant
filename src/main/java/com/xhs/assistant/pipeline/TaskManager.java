@@ -118,7 +118,9 @@ public class TaskManager {
     }
 
     public List<Task> list() {
-        return tasks.values().stream().sorted(Comparator.comparing(t -> Optional.ofNullable(t.createdAt).orElse(OffsetDateTime.MIN))).toList();
+        return tasks.values().stream()
+                .sorted(Comparator.comparing((Task t) -> Optional.ofNullable(t.createdAt).orElse(OffsetDateTime.MIN)).reversed())
+                .toList();
     }
 
     public Task get(String taskId) {

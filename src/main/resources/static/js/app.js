@@ -42,7 +42,8 @@ async function loadBrowserStatus() {
 
 async function loadTasks() {
   try {
-    state.tasks = await api('/api/tasks');
+    state.tasks = (await api('/api/tasks')).sort((a, b) =>
+      new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
     renderTasks();
     if (!state.taskId && state.tasks.length) selectTask(state.tasks[0].taskId);
   } catch (e) { console.error(e); }
@@ -96,7 +97,9 @@ function renderTask(task) {
   $('metric-relevant').textContent = c.relevantCount || 0;
   $('metric-selected').textContent = c.selectedCount || 0;
   $('metric-analyzed').textContent = c.successfulDetailCount || 0;
-  const m = state.result?.metrics?.model || {};
+  const cumulativeCandidate = state.result?.metrics?.cumulativeModel;
+  const m = cumulativeCandidate && Object.keys(cumulativeCandidate).length
+    ? cumulativeCandidate : state.result?.metrics?.model || {};
   $('metric-calls').textContent = m.calls || 0;
   $('metric-tokens').textContent = Number(m.inputTokens || 0) + Number(m.outputTokens || 0);
   const map = { QUEUED: 2, WAITING_BROWSER: 8, SEARCHING: 20, CLASSIFYING: 32, RANKING: 38, COLLECTING_DETAILS: 62, EXTRACTING_IMAGES: 72, GENERATING_REPORT: 88, COMPLETED: 100, PARTIALLY_COMPLETED: 100 };
@@ -175,11 +178,17 @@ function renderResult() {
   }
   const metrics = r.metrics;
   if (metrics) {
+    const cumulative = metrics.cumulativeModel && Object.keys(metrics.cumulativeModel).length
+      ? metrics.cumulativeModel : metrics.model;
     const rows = [['总耗时', `${metrics.totalDurationMs || 0} ms`], ['队列等待', `${metrics.queue?.waitMs || 0} ms`],
       ['搜索耗时', `${metrics.collector?.searchDurationMs || 0} ms`], ['详情耗时', `${metrics.collector?.detailDurationMs || 0} ms`],
       ['缓存命中', metrics.collector?.cacheHits || 0], ['重试', metrics.collector?.retries || 0],
-      ['Agent 轮次', metrics.model?.agentLoopRounds || 0], ['Tool 调用', metrics.model?.toolCalls || 0],
-      ['模型调用', metrics.model?.calls || 0], ['输入 Token', metrics.model?.inputTokens || 0], ['输出 Token', metrics.model?.outputTokens || 0]];
+      ['Agent 轮次（本轮）', metrics.model?.agentLoopRounds || 0], ['Tool 调用（本轮）', metrics.model?.toolCalls || 0],
+      ['模型调用（本轮）', metrics.model?.calls || 0], ['输入 Token（本轮）', metrics.model?.inputTokens || 0],
+      ['输出 Token（本轮）', metrics.model?.outputTokens || 0],
+      ['模型调用（累计）', cumulative?.calls || 0],
+      ['输入 Token（累计）', cumulative?.inputTokens || 0],
+      ['输出 Token（累计）', cumulative?.outputTokens || 0]];
     $('metrics-content').innerHTML = `<table><tbody>${rows.map(x => `<tr><th>${x[0]}</th><td>${x[1]}</td></tr>`).join('')}</tbody></table>`;
   }
 }

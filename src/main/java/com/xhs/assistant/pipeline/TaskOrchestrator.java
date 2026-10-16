@@ -32,55 +32,71 @@ public class TaskOrchestrator {
     }
 
     public void run(Task task, RunContext context) {
+        usageTracker.clear(task.taskId);
         task.startedAt = OffsetDateTime.now();
         task.collection.startedAt = task.startedAt;
         setStage(task, context, "QUEUED", TaskStatus.WAITING_BROWSER, 0.02);
 
-        long t = System.currentTimeMillis();
-        List<Post> candidates = collector.collectCandidates(task.keyword);
-        context.searchDurationMs = System.currentTimeMillis() - t;
-        context.checkCanceled();
-        task.collection.candidateCount = candidates.size();
-        task.collection.distinctPostCount = candidates.size();
-        task.orchestration.checkpoint.candidatePoolSaved = true;
-        repository.saveTask(task);
-        saveCandidates(task, candidates);
-        events.log(task, "外层搜索完成：收集到 " + candidates.size() + " 个不同候选帖子");
+        List<Post> relevant;
+        if (task.orchestration.checkpoint.selectedPostsSaved) {
+            // Retry recovery: search/classification has already produced valid selected posts.
+            // Reusing them avoids another long browser search and another series of model calls.
+            relevant = repository.posts(task.taskId).stream()
+                    .filter(p -> p.postRef != null && "SUCCESS".equals(p.collectionStatus))
+                    .sorted(Comparator.comparing(p -> p.postRef))
+                    .toList();
+            task.collection.relevantCount = relevant.size();
+            task.collection.selectedCount = relevant.size();
+            task.collection.successfulDetailCount = relevant.size();
+            task.collection.failedDetailCount = 0;
+            repository.saveTask(task);
+            events.log(task, "复用已保存的相关 Top 帖子：" + relevant.size() + " 条");
+        } else {
+            long t = System.currentTimeMillis();
+            List<Post> candidates = collector.collectCandidates(task.keyword);
+            context.searchDurationMs = System.currentTimeMillis() - t;
+            context.checkCanceled();
+            task.collection.candidateCount = candidates.size();
+            task.collection.distinctPostCount = candidates.size();
+            task.orchestration.checkpoint.candidatePoolSaved = true;
+            repository.saveTask(task);
+            saveCandidates(task, candidates);
+            events.log(task, "外层搜索完成：收集到 " + candidates.size() + " 个不同候选帖子");
 
-        setStage(task, context, "SEARCHING", TaskStatus.CLASSIFYING, 0.20);
-        List<Map<String, Object>> summaries = new ArrayList<>();
-        for (Post p : candidates) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("postId", p.postId); m.put("title", p.title);
-            m.put("summary", p.author + " " + p.publishedAt); m.put("url", p.url);
-            summaries.add(m);
+            setStage(task, context, "SEARCHING", TaskStatus.CLASSIFYING, 0.20);
+            List<Map<String, Object>> summaries = new ArrayList<>();
+            for (Post p : candidates) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("postId", p.postId); m.put("title", p.title);
+                m.put("summary", p.author + " " + p.publishedAt); m.put("url", p.url);
+                summaries.add(m);
+            }
+            Map<String, Map<String, Object>> classified = new HashMap<>();
+            for (Map<String, Object> x : modelService.classifyRelevance(task.taskId, task.keyword, summaries)) {
+                classified.put(String.valueOf(x.get("postId")), x);
+            }
+            for (Post p : candidates) {
+                Map<String, Object> x = classified.getOrDefault(p.postId, Map.of("label", "MAYBE", "score", 0.5, "reason", "not classified"));
+                p.relevance = String.valueOf(x.getOrDefault("label", "MAYBE"));
+                p.relevanceScore = x.get("score") instanceof Number n ? n.doubleValue() : 0.5;
+                p.relevanceReason = String.valueOf(x.getOrDefault("reason", ""));
+            }
+            relevant = candidates.stream()
+                    .filter(p -> !"IRRELEVANT".equalsIgnoreCase(p.relevance))
+                    .sorted(this::ranking)
+                    .limit(properties.getBrowser().getDetailLimit())
+                    .toList();
+            for (int i = 0; i < relevant.size(); i++) relevant.get(i).postRef = XhsCollector.postRef(i + 1);
+            markDuplicateTitles(relevant);
+            task.collection.relevantCount = relevant.size();
+            task.collection.selectedCount = relevant.size();
+            task.ranking = Map.of("basis", "likes_desc_then_post_id", "missingLikesPolicy", "AFTER_EXISTING",
+                    "approximateLikesPolicy", "CONVERTED_FOR_SORT_ONLY");
+            task.orchestration.checkpoint.selectedPostsSaved = true;
+            repository.saveTask(task);
+            events.publish(task, "status", "候选与排序完成", Map.of("candidateCount", candidates.size(),
+                    "relevantCount", relevant.size(), "selectedCount", relevant.size(), "progress", 0.32));
         }
-        Map<String, Map<String, Object>> classified = new HashMap<>();
-        for (Map<String, Object> x : modelService.classifyRelevance(task.taskId, task.keyword, summaries)) {
-            classified.put(String.valueOf(x.get("postId")), x);
-        }
-        for (Post p : candidates) {
-            Map<String, Object> x = classified.getOrDefault(p.postId, Map.of("label", "MAYBE", "score", 0.5, "reason", "not classified"));
-            p.relevance = String.valueOf(x.getOrDefault("label", "MAYBE"));
-            p.relevanceScore = x.get("score") instanceof Number n ? n.doubleValue() : 0.5;
-            p.relevanceReason = String.valueOf(x.getOrDefault("reason", ""));
-        }
-        List<Post> relevant = candidates.stream()
-                .filter(p -> !"IRRELEVANT".equalsIgnoreCase(p.relevance))
-                .sorted(this::ranking)
-                .limit(properties.getBrowser().getDetailLimit())
-                .toList();
-        for (int i = 0; i < relevant.size(); i++) relevant.get(i).postRef = XhsCollector.postRef(i + 1);
-        markDuplicateTitles(relevant);
-        task.collection.relevantCount = relevant.size();
-        task.collection.selectedCount = relevant.size();
-        task.ranking = Map.of("basis", "likes_desc_then_post_id", "missingLikesPolicy", "AFTER_EXISTING",
-                "approximateLikesPolicy", "CONVERTED_FOR_SORT_ONLY");
-        task.orchestration.checkpoint.selectedPostsSaved = true;
-        repository.saveTask(task);
-        events.publish(task, "status", "候选与排序完成", Map.of("candidateCount", candidates.size(),
-                "relevantCount", relevant.size(), "selectedCount", relevant.size(), "progress", 0.32));
-
         setStage(task, context, "CLASSIFYING", TaskStatus.COLLECTING_DETAILS, 0.35);
         Map<String, Post> parentPosts = parentPosts(task);
         Map<String, List<byte[]>> rawImages = new LinkedHashMap<>();
@@ -113,6 +129,7 @@ public class TaskOrchestrator {
                         pending.sourceUrl = post.url;
                         pending.status = "PENDING";
                         post.imageText.add(pending);
+                        repository.saveAsset(task.taskId, imageAssetName(post.postRef, i + 1), detail.images().get(i));
                     }
                     rawImages.put(post.postRef, detail.images());
                     context.cacheMisses++;
@@ -190,9 +207,20 @@ public class TaskOrchestrator {
         List<Post> result = new ArrayList<>();
         for (Post post : posts) {
             context.checkCanceled();
-            List<byte[]> images = rawImages.getOrDefault(post.postRef, List.of());
+            List<byte[]> images = new ArrayList<>(rawImages.getOrDefault(post.postRef, List.of()));
+            if (images.isEmpty()) {
+                for (int i = 0; i < post.imageText.size(); i++) {
+                    try {
+                        Path asset = repository.taskDir(task.taskId)
+                                .resolve("attachments/images")
+                                .resolve(imageAssetName(post.postRef, i + 1));
+                        if (java.nio.file.Files.exists(asset)) images.add(java.nio.file.Files.readAllBytes(asset));
+                    } catch (Exception ignored) {}
+                }
+            }
             if (post.imageText.isEmpty() && images.isEmpty()) {
                 post.coverage = new ArrayList<>(new LinkedHashSet<>(post.coverage));
+                updateImageCoverageNote(post);
                 repository.savePost(task.taskId, post); result.add(post);
                 continue;
             }
@@ -200,6 +228,7 @@ public class TaskOrchestrator {
             // Details are saved with pending image records only when they were newly collected.
             // Cached posts already contain their extracted text.
             if (post.imageText.stream().allMatch(x -> !"PENDING".equals(x.status))) {
+                updateImageCoverageNote(post);
                 repository.savePost(task.taskId, post); result.add(post); context.cacheHits++; continue;
             }
             post.imageText = new ArrayList<>();
@@ -223,6 +252,7 @@ public class TaskOrchestrator {
             post.imageText = extracted;
             post.coverage = new ArrayList<>(new LinkedHashSet<>(post.coverage));
             if (extracted.stream().anyMatch(x -> "SUCCESS".equals(x.status) && x.text != null && !x.text.isBlank())) post.coverage.add("IMAGE_TEXT");
+            updateImageCoverageNote(post);
             repository.savePost(task.taskId, post);
             if (hasRealDetail(post)) repository.saveCachePost(post);
             result.add(post);
@@ -241,6 +271,22 @@ public class TaskOrchestrator {
         return map;
     }
 
+    private static void updateImageCoverageNote(Post post) {
+        int success = 0, failed = 0;
+        for (ImageText image : post.imageText) {
+            if ("SUCCESS".equals(image.status) && image.text != null && !image.text.isBlank()) success++;
+            else if (!"PENDING".equals(image.status)) failed++;
+        }
+        String imageNote = post.imageText.isEmpty()
+                ? "未提取到可处理图片"
+                : "图片OCR成功" + success + "张/失败" + failed + "张/记录" + post.imageText.size() + "张";
+        post.coverageNote = imageNote + "；视频音画未处理";
+    }
+
+    private static String imageAssetName(String postRef, int index) {
+        return "images/" + postRef + "-" + String.format("%03d", index) + ".png";
+    }
+
     private static boolean isReusableDetail(Post p) {
         return "SUCCESS".equals(p.collectionStatus) && hasRealDetail(p);
     }
@@ -251,6 +297,10 @@ public class TaskOrchestrator {
         boolean hasImageText = p.imageText != null && p.imageText.stream()
                 .anyMatch(x -> "SUCCESS".equals(x.status) && x.text != null && !x.text.isBlank());
         return hasBody || hasImageText;
+    }
+
+    private static long longValue(Object value) {
+        return value instanceof Number number ? number.longValue() : 0;
     }
 
     private int ranking(Post a, Post b) {
@@ -294,9 +344,31 @@ public class TaskOrchestrator {
                 "detailVisited", task.collection.selectedCount, "detailSuccess", task.collection.successfulDetailCount,
                 "retries", context.retries, "cacheHits", context.cacheHits, "cacheMisses", context.cacheMisses,
                 "captchaPauses", context.captchaPauses);
-        m.model = Map.of("concurrency", properties.getModel().getMaxConcurrency(), "calls", u.calls.get(),
-                "agentLoopRounds", u.agentRounds.get(), "toolCalls", u.toolCalls.get(), "finalAnswerGate", u.finalAnswerGate,
-                "inputTokens", u.inputTokens.get(), "outputTokens", u.outputTokens.get(), "usageSource", "API_RESPONSE");
+        Map<String, Object> currentModel = new LinkedHashMap<>(Map.of(
+                "concurrency", properties.getModel().getMaxConcurrency(), "calls", u.calls.get(),
+                "agentLoopRounds", u.agentRounds.get(), "toolCalls", u.toolCalls.get(),
+                "finalAnswerGate", u.finalAnswerGate, "inputTokens", u.inputTokens.get(),
+                "outputTokens", u.outputTokens.get(), "usageSource", "API_RESPONSE"));
+        m.model = currentModel;
+
+        MetricsRecord previous = repository.metrics(task.taskId).orElse(null);
+        Map<String, Object> previousCumulative = previous == null ? Map.of() : previous.cumulativeModel;
+        Map<String, Object> cumulative = new LinkedHashMap<>();
+        for (String key : List.of("calls", "agentLoopRounds", "toolCalls", "inputTokens", "outputTokens")) {
+            cumulative.put(key, longValue(previousCumulative.get(key)) + longValue(currentModel.get(key)));
+        }
+        cumulative.put("finalAnswerGate", u.finalAnswerGate);
+        cumulative.put("usageSource", "API_RESPONSE");
+        m.cumulativeModel = cumulative;
+
+        m.runs = new ArrayList<>(previous == null ? List.of() : previous.runs);
+        Map<String, Object> run = new LinkedHashMap<>();
+        run.put("startedAt", String.valueOf(task.startedAt));
+        run.put("finishedAt", String.valueOf(OffsetDateTime.now()));
+        run.put("totalDurationMs", m.totalDurationMs);
+        run.put("model", currentModel);
+        m.runs.add(run);
+
         m.stages = context.stages;
         repository.saveMetrics(task.taskId, m);
     }

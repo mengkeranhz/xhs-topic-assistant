@@ -159,7 +159,13 @@ public class ModelService {
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user("Keyword: " + keyword + "\nPosts:\n" + json(indexes))), 0.1, 1200, List.of()), false);
             usageTracker.usage(taskId, result.usage());
             JsonNode n = parseJson(result.text());
-            return mapper.convertValue(n.path("neededEvidence"), mapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+            JsonNode needed = n.path("neededEvidence");
+            if (!needed.isArray() || needed.isEmpty()) {
+                return List.of(Map.of("query", keyword, "postRefs", List.of()));
+            }
+            List<Map<String, Object>> result2 = mapper.convertValue(needed,
+                    mapper.getTypeFactory().constructCollectionType(List.class, Map.class));
+            return result2 == null ? List.of(Map.of("query", keyword, "postRefs", List.of())) : result2;
         } catch (Exception e) {
             if (!offlineFallback()) throw e;
             return List.of(Map.of("query", keyword, "postRefs", List.of()));
