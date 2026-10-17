@@ -146,18 +146,21 @@ public class XhsCollector {
                     nestedString(state, "user", "nickname"), findLabel(text, List.of("作者", "博主")));
             p.publishedAt = firstNonBlank(stringValue(noteCard.get("time"), state.get("time")),
                     nestedString(noteCard, "note", "time"), findDate(text));
-            p.likes = firstMetric(extractMetric(text, List.of("点赞", "赞")),
+            p.likes = firstMetric(
                     countFromPath(noteCard, "interact_info", "liked_count"),
                     countFromPath(noteCard, "interactInfo", "liked"),
-                    countFromPath(state, "interact_info", "liked_count"));
-            p.collections = firstMetric(extractMetric(text, List.of("收藏", "薯")),
+                    countFromPath(state, "interact_info", "liked_count"),
+                    extractMetric(text, List.of("点赞", "赞")));
+            p.collections = firstMetric(
                     countFromPath(noteCard, "interact_info", "collected_count"),
                     countFromPath(noteCard, "interactInfo", "collected"),
-                    countFromPath(state, "interact_info", "collected_count"));
-            p.comments = firstMetric(extractMetric(text, List.of("评论", "评论数")),
+                    countFromPath(state, "interact_info", "collected_count"),
+                    extractMetric(text, List.of("收藏", "薯")));
+            p.comments = firstMetric(
                     countFromPath(noteCard, "interact_info", "comment_count"),
                     countFromPath(noteCard, "interactInfo", "comment"),
-                    countFromPath(state, "interact_info", "comment_count"));
+                    countFromPath(state, "interact_info", "comment_count"),
+                    extractMetric(text, List.of("评论", "评论数")));
             p.collectedAt = OffsetDateTime.now();
             p.collectionStatus = "CANDIDATE";
             p.contentHash = sha256(p.title + "|" + p.url);
@@ -361,9 +364,58 @@ public class XhsCollector {
     }
 
     public void ensureInteractive(Page page) {
-        String body = page.innerText("body").toLowerCase(Locale.ROOT);
-        if (body.contains("验证码") || body.contains("verify") || body.contains("安全验证")) throw new LoginRequiredException("CAPTCHA_OR_VERIFICATION_REQUIRED");
-        if (page.url().contains("/login")) throw new LoginRequiredException("LOGIN_REQUIRED");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> signals = (Map<String, Object>) page.evaluate("""
+                () => ({
+                  url: location.href,
+                  title: document.title || '',
+                  body: document.body?.innerText || '',
+                  captchaSelectors: document.querySelectorAll(
+                    'iframe[src*="captcha"], iframe[src*="verify"], [class*="captcha"], [id*="captcha"], [class*="slider"], [id*="slider"]'
+                  ).length
+                })
+                """);
+        PageInteractionState state = interactionState(
+                String.valueOf(signals.getOrDefault("url", "")),
+                String.valueOf(signals.getOrDefault("title", "")),
+                String.valueOf(signals.getOrDefault("body", "")),
+                ((Number) signals.getOrDefault("captchaSelectors", 0)).intValue());
+        if (state == PageInteractionState.CAPTCHA_REQUIRED) {
+            throw new LoginRequiredException("CAPTCHA_OR_VERIFICATION_REQUIRED");
+        }
+        if (state == PageInteractionState.LOGIN_REQUIRED) {
+            throw new LoginRequiredException("LOGIN_REQUIRED");
+        }
+    }
+
+    static PageInteractionState interactionState(String url, String title, String body, int captchaSelectors) {
+        String lowerUrl = url == null ? "" : url.toLowerCase(Locale.ROOT);
+        String lowerTitle = title == null ? "" : title.toLowerCase(Locale.ROOT);
+        String lowerBody = body == null ? "" : body.toLowerCase(Locale.ROOT);
+        if (lowerUrl.contains("/login") || lowerUrl.contains("loginrequired=true")) {
+            return PageInteractionState.LOGIN_REQUIRED;
+        }
+        boolean strongCaptchaSignal = lowerUrl.contains("/captcha")
+                || lowerUrl.contains("/verify")
+                || lowerTitle.contains("验证码")
+                || lowerTitle.contains("安全验证")
+                || captchaSelectors > 0;
+        if (strongCaptchaSignal) return PageInteractionState.CAPTCHA_REQUIRED;
+
+        boolean weakCaptchaSignal = lowerBody.contains("验证码")
+                || lowerBody.contains("安全验证")
+                || lowerBody.contains("verify");
+        String compactBody = body == null ? "" : body.replaceAll("\\s+", "");
+        // A normal long technical article may legitimately mention captcha/verification.
+        // Only treat weak words as an interaction page when the document is short and prompt-like.
+        if (weakCaptchaSignal && compactBody.length() <= 240) {
+            return PageInteractionState.CAPTCHA_REQUIRED;
+        }
+        return PageInteractionState.NORMAL;
+    }
+
+    enum PageInteractionState {
+        NORMAL, LOGIN_REQUIRED, CAPTCHA_REQUIRED
     }
 
     public void ensureDetailAvailable(Page page, Post candidate) {

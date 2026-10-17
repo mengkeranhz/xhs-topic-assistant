@@ -76,6 +76,29 @@ public class TaskRepository {
         return Optional.ofNullable(store.readJson(taskDir(taskId).resolve("posts").resolve(postRef + ".md"), Post.class));
     }
 
+    public void saveSelected(String taskId, List<Post> selected) {
+        Map<String, Object> fm = Map.of("type", "selected-posts", "taskId", taskId, "version", 1);
+        store.writeJson(taskDir(taskId).resolve("selected.md"), "Selected posts", fm, selected);
+    }
+
+    public List<Post> candidates(String taskId) {
+        Path file = taskDir(taskId).resolve("candidates.md");
+        if (!Files.exists(file)) return List.of();
+        Post[] posts = store.readJson(file, Post[].class);
+        return posts == null ? List.of() : Arrays.stream(posts).filter(Objects::nonNull).toList();
+    }
+
+    public Optional<List<Post>> selected(String taskId) {
+        Path file = taskDir(taskId).resolve("selected.md");
+        if (!Files.exists(file)) return Optional.empty();
+        Post[] posts = store.readJson(file, Post[].class);
+        if (posts == null) return Optional.empty();
+        return Optional.of(Arrays.stream(posts)
+                .filter(Objects::nonNull)
+                .sorted(Comparator.comparing(p -> p.postRef))
+                .toList());
+    }
+
     public void saveReport(String taskId, ReportRecord report) {
         Map<String, Object> fm = Map.of("type", "report", "taskId", taskId, "version", 1);
         store.writeJson(taskDir(taskId).resolve("report.md"), "Research report", fm, report);
@@ -143,6 +166,17 @@ public class TaskRepository {
             }
             return result;
         } catch (IOException e) { return List.of(); }
+    }
+
+    public void appendModelUsage(String taskId, ModelUsageRecord row) {
+        Map<String, Object> fm = Map.of("type", "model-usage", "taskId", taskId, "version", 1);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> value = objectMapper.convertValue(row, Map.class);
+        store.appendJsonLine(taskDir(taskId).resolve("model-usage.md"), fm, value);
+    }
+
+    public List<ModelUsageRecord> modelUsage(String taskId) {
+        return List.of();
     }
 
     public void saveCachePost(Post post) {

@@ -1,4 +1,4 @@
-const state = { tasks: [], taskId: null, result: null, reportText: '', source: null, renderTimer: null, selectedPost: null };
+const state = { tasks: [], taskId: null, result: null, modelUsage: [], reportText: '', source: null, renderTimer: null, selectedPost: null };
 const $ = id => document.getElementById(id);
 
 async function api(path, options = {}) {
@@ -40,6 +40,39 @@ async function loadBrowserStatus() {
   } catch (e) { console.error(e); }
 }
 
+async function loadModelUsage() {
+  if (!state.taskId) return;
+  try { state.modelUsage = await api(`/api/tasks/${state.taskId}/model-usage`); }
+  catch (e) { state.modelUsage = []; console.error(e); }
+}
+
+function pollUntilTerminal(url, options = {}) {
+  const intervalMs = options.intervalMs || 800;
+  const timeoutMs = options.timeoutMs || 120000;
+  const isTerminal = options.isTerminal || (x => ['COMPLETED', 'FAILED'].includes(x?.status));
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        if (options.shouldStop?.()) return reject(new Error('POLL_STOPPED'));
+        if (Date.now() - started > timeoutMs) throw new Error('POLL_TIMEOUT');
+        const current = await api(url);
+        options.onStatus?.(current);
+        if (isTerminal(current)) return resolve(current);
+        setTimeout(tick, intervalMs);
+      } catch (e) { reject(e); }
+    };
+    setTimeout(tick, intervalMs);
+  });
+}
+
+function safePostUrl(url) {
+  const parsed = new URL(String(url || ''));
+  if (parsed.protocol !== 'https:') throw new Error('Invalid post URL protocol');
+  if (parsed.hostname !== 'www.xiaohongshu.com') throw new Error('Invalid post URL host');
+  return parsed.toString();
+}
+
 async function loadTasks() {
   try {
     state.tasks = (await api('/api/tasks')).sort((a, b) =>
@@ -76,6 +109,9 @@ async function selectTask(taskId) {
   await refreshTask();
   subscribe(taskId);
   await refreshResult(true);
+  await loadModelUsage();
+  renderResult();
+  loadQuestions().catch(console.error);
 }
 
 async function refreshTask() {
@@ -97,8 +133,14 @@ function renderTask(task) {
   $('metric-relevant').textContent = c.relevantCount || 0;
   $('metric-selected').textContent = c.selectedCount || 0;
   $('metric-analyzed').textContent = c.successfulDetailCount || 0;
+  const allUsage = state.modelUsage || [];
+  const usageTotal = allUsage.reduce((acc, x) => ({
+    calls: acc.calls + Number(x.calls || 0),
+    inputTokens: acc.inputTokens + Number(x.inputTokens || 0),
+    outputTokens: acc.outputTokens + Number(x.outputTokens || 0)
+  }), {calls: 0, inputTokens: 0, outputTokens: 0});
   const cumulativeCandidate = state.result?.metrics?.cumulativeModel;
-  const m = cumulativeCandidate && Object.keys(cumulativeCandidate).length
+  const m = allUsage.length ? usageTotal : cumulativeCandidate && Object.keys(cumulativeCandidate).length
     ? cumulativeCandidate : state.result?.metrics?.model || {};
   $('metric-calls').textContent = m.calls || 0;
   $('metric-tokens').textContent = Number(m.inputTokens || 0) + Number(m.outputTokens || 0);
@@ -144,40 +186,47 @@ function renderResult() {
   $('gate-pill').className = `gate-pill ${report.finalAnswerGate || ''}`;
   const posts = r.posts || [];
   $('post-count').textContent = posts.length;
-  $('post-list').innerHTML = posts.map(p => `
-    <article class="post-card" data-ref="${esc(p.postRef)}">
+  $('post-list').innerHTML = posts.map(p => {
+    let originalUrl = '#';
+    try { originalUrl = safePostUrl(p.url); } catch (_) {}
+    return `
+    <article class="post-card" data-ref="${esc(p.postRef)}" data-task-id="${esc(state.taskId)}">
       <div class="post-title">[${esc(p.postRef)}] ${esc(p.title || '无标题')}</div>
       <div class="post-meta">
         <span class="tag">${esc(p.author || '作者缺失')}</span><span class="tag">${esc(p.publishedAt || '时间缺失')}</span>
         <span class="tag">点赞 ${esc(p.likes?.raw || '缺失')}</span><span class="tag">${esc(p.collectionStatus || '')}</span>
+        ${originalUrl === '#' ? '' : `<a class="original-link" href="${esc(originalUrl)}" target="_blank" rel="noopener noreferrer nofollow">打开原帖</a>`}
       </div>
+      <div class="five-status"></div>
       <div class="post-detail">${esc(p.body || '')}${p.imageText?.length ? '\n[图片文字]\n' + p.imageText.map(x => esc(x.text || '')).join('\n') : ''}</div>
-    </article>`).join('');
+    </article>`;
+  }).join('');
   document.querySelectorAll('.post-card .post-title').forEach(el => {
-    el.onclick = async () => {
-      const card = el.closest('.post-card'), ref = card.dataset.ref;
-      document.querySelectorAll('.post-card').forEach(x => x.classList.remove('selected')); card.classList.add('selected');
-      if (!card.dataset.fiveLoaded) {
-        try {
-          const status = await api(`/api/tasks/${state.taskId}/posts/${ref}/5w1h/status`);
-          if (status.status !== 'COMPLETED') await api(`/api/tasks/${state.taskId}/posts/${ref}/5w1h`, { method: 'POST' });
-          const five = await api(`/api/tasks/${state.taskId}/posts/${ref}/5w1h`);
-          const detail = card.querySelector('.post-detail');
-          detail.innerHTML += `<div><strong>5W1H</strong><br>${Object.entries(five).map(([k,v]) => `${esc(k.toUpperCase())}: ${esc(v?.text || '未提及')}`).join('<br>')}</div>`;
-          card.dataset.fiveLoaded = '1';
-        } catch (e) { addEvent(`5W1H 加载失败：${e.message}`, {}, true); }
-      }
-    };
+    el.onclick = () => requestFiveW1H(el.closest('.post-card'));
+  });
+  document.querySelectorAll('.post-card .original-link').forEach(el => {
+    el.onclick = event => event.stopPropagation();
   });
   const diff = r.diff;
   if (diff) {
-    $('diff-summary').textContent = `新增 ${diff.newPosts?.length || 0} · 消失 ${diff.missingPosts?.length || 0}`;
-    $('diff-content').innerHTML = `<strong>新增帖子</strong><div>${diff.newPosts?.map(esc).join('、') || '无'}</div>
+    const formatDetail = x => `${x.postRef} · ${x.postId} · ${x.title || '无标题'}`;
+    const newPosts = diff.newPostDetails?.length ? diff.newPostDetails.map(formatDetail) : (diff.newPosts || []);
+    const missingPosts = diff.missingPostDetails?.length ? diff.missingPostDetails.map(formatDetail) : (diff.missingPosts || []);
+    $('diff-summary').textContent = `新增 ${newPosts.length} · 消失 ${missingPosts.length} · 复用 ${diff.reused?.posts || 0}`;
+    $('diff-content').innerHTML = `<strong>新增帖子</strong><ul>${newPosts.map(x => `<li>${esc(x)}</li>`).join('') || '<li>无</li>'}</ul>
+      <strong>本次搜索范围内消失帖子</strong><ul>${missingPosts.map(x => `<li>${esc(x)}</li>`).join('') || '<li>无</li>'}</ul>
       <strong>热度变化</strong><pre>${esc(JSON.stringify(diff.metricChanges || [], null, 2))}</pre>
-      <strong>新观点</strong><ul>${(diff.newOpinions || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>`;
+      <strong>新观点</strong><ul>${(diff.newOpinions || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+      <strong>复用统计</strong><pre>${esc(JSON.stringify(diff.reused || {}, null, 2))}</pre>`;
   }
   const metrics = r.metrics;
   if (metrics) {
+    const allUsage = state.modelUsage || [];
+    const usageTotal = allUsage.reduce((acc, x) => ({
+      calls: acc.calls + Number(x.calls || 0),
+      inputTokens: acc.inputTokens + Number(x.inputTokens || 0),
+      outputTokens: acc.outputTokens + Number(x.outputTokens || 0)
+    }), {calls: 0, inputTokens: 0, outputTokens: 0});
     const cumulative = metrics.cumulativeModel && Object.keys(metrics.cumulativeModel).length
       ? metrics.cumulativeModel : metrics.model;
     const rows = [['总耗时', `${metrics.totalDurationMs || 0} ms`], ['队列等待', `${metrics.queue?.waitMs || 0} ms`],
@@ -188,7 +237,10 @@ function renderResult() {
       ['输出 Token（本轮）', metrics.model?.outputTokens || 0],
       ['模型调用（累计）', cumulative?.calls || 0],
       ['输入 Token（累计）', cumulative?.inputTokens || 0],
-      ['输出 Token（累计）', cumulative?.outputTokens || 0]];
+      ['输出 Token（累计）', cumulative?.outputTokens || 0],
+      ['全量调用记录', allUsage.length],
+      ['全量输入 Token', usageTotal.inputTokens],
+      ['全量输出 Token', usageTotal.outputTokens]];
     $('metrics-content').innerHTML = `<table><tbody>${rows.map(x => `<tr><th>${x[0]}</th><td>${x[1]}</td></tr>`).join('')}</tbody></table>`;
   }
 }
@@ -203,18 +255,67 @@ document.addEventListener('click', e => {
   if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); card.querySelector('.post-title').click(); }
 });
 
+async function requestFiveW1H(card) {
+  if (!card || !state.taskId || card.dataset.fiveRequesting === '1' || card.dataset.fiveLoaded === '1') return;
+  const ref = card.dataset.ref;
+  const statusEl = card.querySelector('.five-status');
+  card.dataset.fiveRequesting = '1';
+  document.querySelectorAll('.post-card').forEach(x => x.classList.remove('selected'));
+  card.classList.add('selected');
+  statusEl.innerHTML = '<span class="tag">5W1H 生成中…</span>';
+  try {
+    await api(`/api/tasks/${state.taskId}/posts/${ref}/5w1h`, { method: 'POST' });
+    const final = await pollUntilTerminal(`/api/tasks/${state.taskId}/posts/${ref}/5w1h/status`, {
+      shouldStop: () => !card.isConnected || state.taskId !== card.dataset.taskId,
+      onStatus: current => {
+        statusEl.innerHTML = `<span class="tag">5W1H：${esc(current.status || 'RUNNING')}</span>`;
+      }
+    });
+    if (final.status === 'FAILED') throw new Error(final.failure || '5W1H generation failed');
+    const five = await api(`/api/tasks/${state.taskId}/posts/${ref}/5w1h`);
+    statusEl.innerHTML = '<span class="tag">5W1H：已完成</span>';
+    const detail = card.querySelector('.post-detail');
+    detail.insertAdjacentHTML('beforeend', `<div><strong>5W1H</strong><br>${Object.entries(five).map(([k, v]) => `${esc(k.toUpperCase())}: ${esc(v?.text || '未提及')}`).join('<br>')}</div>`);
+    card.dataset.fiveLoaded = '1';
+  } catch (e) {
+    statusEl.innerHTML = `<span class="tag">5W1H：失败，点击标题重试</span>`;
+    addEvent(`5W1H 加载失败：${e.message}`, {}, true);
+  } finally {
+    card.dataset.fiveRequesting = '';
+  }
+}
+
 async function ask() {
   const q = $('question-input').value.trim(); if (!q || !state.taskId) return;
   try {
-    await api(`/api/tasks/${state.taskId}/questions`, { method: 'POST', body: JSON.stringify({ question: q }) });
-    $('question-input').value = ''; addEvent('追问已提交', {});
-    setTimeout(loadQuestions, 1200);
+    const created = await api(`/api/tasks/${state.taskId}/questions`, {
+      method: 'POST',
+      body: JSON.stringify({ question: q })
+    });
+    $('question-input').value = '';
+    renderQuestions([created]);
+    addEvent('追问已提交', {});
+    const final = await pollUntilTerminal(`/api/tasks/${state.taskId}/questions/${created.questionId}`, {
+      onStatus: current => renderQuestions([current])
+    });
+    if (final.status === 'FAILED') throw new Error(final.failure || 'Question generation failed');
+    await loadQuestions();
   } catch (e) { addEvent(`追问失败：${e.message}`, {}, true); }
 }
 
 async function loadQuestions() {
+  if (!state.taskId) return;
   const qs = await api(`/api/tasks/${state.taskId}/questions`);
-  $('question-list').innerHTML = qs.map(x => `<div class="question"><div class="q">${esc(x.question)}</div><div class="a">${esc(x.answer || x.status || '')}</div></div>`).join('');
+  renderQuestions(qs);
+}
+
+function renderQuestions(qs) {
+  $('question-list').innerHTML = (qs || []).map(x => `
+    <div class="question">
+      <div class="q">${esc(x.question)}</div>
+      <div class="a">${esc(x.answer || x.status || '')}</div>
+      ${x.citations?.length ? `<div class="question-citations">${x.citations.map(c => `<span class="tag">${esc(c)}</span>`).join('')}</div>` : ''}
+    </div>`).join('');
 }
 
 $('start-button').onclick = startTask;

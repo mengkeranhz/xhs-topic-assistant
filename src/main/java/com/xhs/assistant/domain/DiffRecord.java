@@ -9,6 +9,8 @@ public class DiffRecord {
     public String baseTaskId;
     public List<String> newPosts = new ArrayList<>();
     public List<String> missingPosts = new ArrayList<>();
+    public List<Map<String, Object>> newPostDetails = new ArrayList<>();
+    public List<Map<String, Object>> missingPostDetails = new ArrayList<>();
     public List<Map<String, Object>> metricChanges = new ArrayList<>();
     public List<String> newOpinions = new ArrayList<>();
     public Map<String, Object> reused = Map.of();

@@ -16,10 +16,17 @@ public class ModelService {
     private final AssistantProperties properties;
     private final ObjectMapper mapper;
     private final UsageTracker usageTracker;
+    private final ModelUsageStore modelUsageStore;
 
-    public ModelService(LlmClientSelector selector, AssistantProperties properties, ObjectMapper mapper, UsageTracker usageTracker) {
+    public ModelService(LlmClientSelector selector, AssistantProperties properties, ObjectMapper mapper,
+                        UsageTracker usageTracker, ModelUsageStore modelUsageStore) {
         this.selector = selector; this.properties = properties; this.mapper = mapper.copy();
-        this.usageTracker = usageTracker;
+        this.usageTracker = usageTracker; this.modelUsageStore = modelUsageStore;
+    }
+
+    private void recordUsage(String taskId, String action, LlmTypes.Usage usage) {
+        usageTracker.usage(taskId, usage);
+        modelUsageStore.record(taskId, action, usage);
     }
 
     public boolean offlineFallback() { return properties.getModel().isAllowOfflineFallback(); }
@@ -48,7 +55,7 @@ public class ModelService {
         try {
             LlmClient client = selector.current().orElseThrow(() -> new IllegalStateException("Unknown model provider"));
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user(prompt)), 0.0, 2500, List.of()), false);
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "CLASSIFY_RELEVANCE", result.usage());
             JsonNode node = parseJson(result.text());
             Map<String, Map<String, Object>> byPostId = new LinkedHashMap<>();
             findClassificationArray(node).forEach(n -> {
@@ -106,7 +113,7 @@ public class ModelService {
         try {
             LlmClient client = selector.current().orElseThrow();
             ChatResult result = client.extractImageText("Extract visible text from " + filename + ".", List.of(data));
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "IMAGE_OCR", result.usage());
             JsonNode node = parseJson(result.text());
             return new ImageTextResult(node.path("text").asText(""), node.path("confidence").asText("UNKNOWN"));
         } catch (Exception e) {
@@ -126,7 +133,7 @@ public class ModelService {
         try {
             LlmClient client = selector.current().orElseThrow();
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user(json(evidence))), 0.1, 1600, List.of()), false);
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "FIVE_W1H", result.usage());
             return mapper.convertValue(parseJson(result.text()), Map.class);
         } catch (Exception e) {
             if (!offlineFallback()) throw e;
@@ -157,7 +164,7 @@ public class ModelService {
         try {
             LlmClient client = selector.current().orElseThrow();
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user("Keyword: " + keyword + "\nPosts:\n" + json(indexes))), 0.1, 1200, List.of()), false);
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "REPORT_PLAN", result.usage());
             JsonNode n = parseJson(result.text());
             JsonNode needed = n.path("neededEvidence");
             if (!needed.isArray() || needed.isEmpty()) {
@@ -177,7 +184,7 @@ public class ModelService {
         client.stream(new ChatRequest(system, List.of(Message.user(prompt)), properties.getModel().getTemperature(), 6000, List.of()),
                 new LlmTypes.StreamHandler() {
                     @Override public void text(String delta) { tokenConsumer.accept(delta); }
-                    @Override public void usage(LlmTypes.Usage usage) { usageTracker.usage("current", usage); }
+                    @Override public void usage(LlmTypes.Usage usage) { recordUsage(taskId, "REPORT_SYNTHESIS", usage); }
                 });
     }
 
@@ -190,7 +197,7 @@ public class ModelService {
         try {
             LlmClient client = selector.current().orElseThrow();
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user("Question: " + input.question + "\nEvidence:\n" + json(evidence))), 0.1, 1800, List.of()), false);
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "ANSWER_QUESTION", result.usage());
             JsonNode n = parseJson(result.text());
             input.answer = n.path("answer").asText("");
             n.path("citations").forEach(c -> input.citations.add(c.asText()));
@@ -207,15 +214,26 @@ public class ModelService {
     private JsonNode parseJson(String text) {
         try {
             return mapper.readTree(text);
-        } catch (Exception ignored) {
-            int a = Math.max(text.indexOf('{'), text.indexOf('['));
-            int b = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
-            if (a >= 0 && b > a) {
-                try { return mapper.readTree(text.substring(a, b + 1)); }
-                catch (Exception ignored2) {}
-            }
-            throw new IllegalArgumentException("Model did not return JSON: " + text);
+        } catch (Exception ignored) {}
+        String cleaned = text == null ? "" : text.trim();
+        // Remove Markdown fences without altering JSON itself.
+        if (cleaned.startsWith("```")) {
+            cleaned = cleaned.replaceFirst("^```(?:json)?\\s*", "");
+            cleaned = cleaned.replaceFirst("\\s*```$", "");
         }
+        try {
+            return mapper.readTree(cleaned);
+        } catch (Exception ignored) {}
+        int start = cleaned.indexOf('{');
+        int arrayStart = cleaned.indexOf('[');
+        if (arrayStart >= 0 && (start < 0 || arrayStart < start)) start = arrayStart;
+        int end = Math.max(cleaned.lastIndexOf('}'), cleaned.lastIndexOf(']'));
+        if (start >= 0 && end > start) {
+            String candidate = cleaned.substring(start, end + 1);
+            try { return mapper.readTree(candidate); }
+            catch (Exception ignored) {}
+        }
+        throw new IllegalArgumentException("Model did not return JSON: " + text);
     }
 
     private String json(Object value) {
@@ -229,7 +247,7 @@ public String repairReport(String taskId, String report, List<String> failedChec
         try {
             LlmClient client = selector.current().orElseThrow();
             ChatResult result = client.chat(new ChatRequest(system, List.of(Message.user(prompt)), 0.1, 6000, List.of()), false);
-            usageTracker.usage(taskId, result.usage());
+            recordUsage(taskId, "REPORT_REPAIR", result.usage());
             return result.text();
         } catch (Exception e) {
             if (!offlineFallback()) throw e;

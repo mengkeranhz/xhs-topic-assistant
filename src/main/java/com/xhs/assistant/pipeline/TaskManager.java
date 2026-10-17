@@ -229,10 +229,14 @@ public class TaskManager {
         if (post.fiveW1H != null) return completedAnalysis(taskId, postRef, post.fiveW1H);
         AnalysisStatus status = analyses.computeIfAbsent(taskId + ":" + postRef, k -> {
             AnalysisStatus s = new AnalysisStatus();
-            s.taskId = taskId; s.postRef = postRef; s.status = "RUNNING"; s.updatedAt = OffsetDateTime.now();
+            s.taskId = taskId; s.postRef = postRef; s.status = "NOT_STARTED"; s.updatedAt = OffsetDateTime.now();
             return s;
         });
-        if (!"RUNNING".equals(status.status)) return status;
+        if ("COMPLETED".equals(status.status)) return status;
+        if ("RUNNING".equals(status.status)) return status;
+        status.status = "RUNNING";
+        status.failure = null;
+        status.updatedAt = OffsetDateTime.now();
         sideJobs.submit(() -> {
             try {
                 Map<String, Object> evidence = postEvidence(post);

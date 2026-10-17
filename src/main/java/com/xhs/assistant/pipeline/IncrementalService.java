@@ -22,8 +22,14 @@ public class IncrementalService {
 
         DiffRecord d = new DiffRecord();
         d.taskId = taskId; d.baseTaskId = parentTaskId;
-        current.stream().filter(p -> !previousMap.containsKey(p.postId)).forEach(p -> d.newPosts.add(p.postRef));
-        previous.stream().filter(p -> !currentMap.containsKey(p.postId)).forEach(p -> d.missingPosts.add(p.postRef));
+        current.stream().filter(p -> !previousMap.containsKey(p.postId)).forEach(p -> {
+            d.newPosts.add(p.postRef);
+            d.newPostDetails.add(postDetail(p));
+        });
+        previous.stream().filter(p -> !currentMap.containsKey(p.postId)).forEach(p -> {
+            d.missingPosts.add(p.postRef);
+            d.missingPostDetails.add(postDetail(p));
+        });
 
         for (Post now : current) {
             Post old = previousMap.get(now.postId);
@@ -52,6 +58,15 @@ public class IncrementalService {
         d.reused = Map.of("posts", reusedPosts, "imageOcr", reusedOcr, "fiveW1H", reused5w);
         repository.saveDiff(taskId, d);
         return d;
+    }
+
+    private static Map<String, Object> postDetail(Post p) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("postRef", p.postRef);
+        detail.put("postId", p.postId);
+        detail.put("title", p.title);
+        detail.put("url", p.url);
+        return detail;
     }
 
     private Map<String, Object> metric(MetricValue v) {

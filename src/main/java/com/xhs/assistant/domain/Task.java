@@ -36,6 +36,8 @@ public class Task {
         public boolean candidatePoolSaved;
         public boolean selectedPostsSaved;
         public boolean reportSaved;
+        public List<String> selectedPostRefs = new ArrayList<>();
+        public List<String> selectedPostIds = new ArrayList<>();
         public List<String> completedDetailPostRefs = new ArrayList<>();
         public List<String> failedDetailPostRefs = new ArrayList<>();
     }

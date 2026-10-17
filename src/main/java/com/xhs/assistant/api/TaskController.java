@@ -25,11 +25,16 @@ public class TaskController {
     private final TaskRepository repository;
     private final SseEventHub hub;
     private final AssistantProperties properties;
+    private final ModelUsageStore modelUsageStore;
+    private final IncrementalService incrementalService;
     private final HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
 
     public TaskController(TaskManager manager, TaskRepository repository, SseEventHub hub,
-                          AssistantProperties properties) {
-        this.manager = manager; this.repository = repository; this.hub = hub; this.properties = properties;
+                          AssistantProperties properties, ModelUsageStore modelUsageStore,
+                          IncrementalService incrementalService) {
+        this.manager = manager; this.repository = repository; this.hub = hub;
+        this.properties = properties; this.modelUsageStore = modelUsageStore;
+        this.incrementalService = incrementalService;
     }
 
     @GetMapping("/browser/status")
@@ -112,6 +117,15 @@ public class TaskController {
         return ResponseEntity.of(repository.diff(taskId));
     }
 
+    @PostMapping("/tasks/{taskId}/diff/recompute")
+    public DiffRecord recomputeDiff(@PathVariable String taskId) {
+        Task task = manager.get(taskId);
+        if (task.parentTaskId == null || task.parentTaskId.isBlank()) {
+            throw new IllegalArgumentException("INCREMENTAL_PARENT_REQUIRED");
+        }
+        return incrementalService.compare(taskId, task.parentTaskId);
+    }
+
     @PostMapping("/tasks/{taskId}/posts/{postRef}/5w1h")
     public ResponseEntity<AnalysisStatus> createFive(@PathVariable String taskId, @PathVariable String postRef) {
         AnalysisStatus status = manager.startFiveW1H(taskId, postRef);
@@ -142,6 +156,11 @@ public class TaskController {
     @GetMapping("/tasks/{taskId}/questions/{questionId}")
     public QuestionRecord question(@PathVariable String taskId, @PathVariable String questionId) {
         return repository.question(taskId, questionId).orElseThrow();
+    }
+
+    @GetMapping("/tasks/{taskId}/model-usage")
+    public List<ModelUsageRecord> modelUsage(@PathVariable String taskId) {
+        return modelUsageStore.list(taskId);
     }
 
     @GetMapping("/tasks/{taskId}/metrics")

@@ -39,18 +39,15 @@ public class TaskOrchestrator {
 
         List<Post> relevant;
         if (task.orchestration.checkpoint.selectedPostsSaved) {
-            // Retry recovery: search/classification has already produced valid selected posts.
-            // Reusing them avoids another long browser search and another series of model calls.
-            relevant = repository.posts(task.taskId).stream()
-                    .filter(p -> p.postRef != null && "SUCCESS".equals(p.collectionStatus))
-                    .sorted(Comparator.comparing(p -> p.postRef))
-                    .toList();
+            relevant = restoreSelectedPosts(task);
             task.collection.relevantCount = relevant.size();
             task.collection.selectedCount = relevant.size();
-            task.collection.successfulDetailCount = relevant.size();
-            task.collection.failedDetailCount = 0;
+            long successCount = relevant.stream().filter(p -> "SUCCESS".equals(p.collectionStatus)).count();
+            task.collection.successfulDetailCount = (int) successCount;
+            task.collection.failedDetailCount = relevant.size() - (int) successCount;
             repository.saveTask(task);
-            events.log(task, "复用已保存的相关 Top 帖子：" + relevant.size() + " 条");
+            events.log(task, "复用已保存的入选帖子：" + relevant.size()
+                    + " 条；成功详情 " + successCount + " 条，待补采 " + (relevant.size() - successCount) + " 条");
         } else {
             long t = System.currentTimeMillis();
             List<Post> candidates = collector.collectCandidates(task.keyword);
@@ -93,10 +90,21 @@ public class TaskOrchestrator {
             task.ranking = Map.of("basis", "likes_desc_then_post_id", "missingLikesPolicy", "AFTER_EXISTING",
                     "approximateLikesPolicy", "CONVERTED_FOR_SORT_ONLY");
             task.orchestration.checkpoint.selectedPostsSaved = true;
+            task.orchestration.checkpoint.selectedPostRefs = relevant.stream().map(p -> p.postRef).toList();
+            task.orchestration.checkpoint.selectedPostIds = relevant.stream().map(p -> p.postId).toList();
+            task.orchestration.checkpoint.completedDetailPostRefs.clear();
+            task.orchestration.checkpoint.failedDetailPostRefs.clear();
+            repository.saveSelected(task.taskId, relevant);
             repository.saveTask(task);
             events.publish(task, "status", "候选与排序完成", Map.of("candidateCount", candidates.size(),
                     "relevantCount", relevant.size(), "selectedCount", relevant.size(), "progress", 0.32));
         }
+
+        if (relevant.isEmpty()) {
+            finishEmptySearch(task, context);
+            return;
+        }
+
         setStage(task, context, "CLASSIFYING", TaskStatus.COLLECTING_DETAILS, 0.35);
         Map<String, Post> parentPosts = parentPosts(task);
         Map<String, List<byte[]>> rawImages = new LinkedHashMap<>();
@@ -141,7 +149,7 @@ public class TaskOrchestrator {
                             "url", candidate.url, "xsecTokenPresent", candidate.url != null && candidate.url.contains("xsec_token="),
                             "retryable", false, "attempts", ++post.attempts);
                     repository.savePost(task.taskId, post);
-                    task.orchestration.checkpoint.failedDetailPostRefs.add(post.postRef);
+                    addUnique(task.orchestration.checkpoint.failedDetailPostRefs, post.postRef);
                     task.collection.successfulDetailCount = successful.size();
                     task.collection.failedDetailCount = task.collection.selectedCount - successful.size();
                     repository.saveTask(task);
@@ -161,9 +169,9 @@ public class TaskOrchestrator {
                     repository.saveCachePost(post);
                 }
                 successful.add(post);
-                task.orchestration.checkpoint.completedDetailPostRefs.add(post.postRef);
+                addUnique(task.orchestration.checkpoint.completedDetailPostRefs, post.postRef);
             } else {
-                task.orchestration.checkpoint.failedDetailPostRefs.add(post.postRef);
+                addUnique(task.orchestration.checkpoint.failedDetailPostRefs, post.postRef);
             }
             repository.savePost(task.taskId, post);
             repository.saveTask(task);
@@ -172,7 +180,15 @@ public class TaskOrchestrator {
         task.collection.successfulDetailCount = successful.size();
         task.collection.failedDetailCount = relevant.size() - successful.size();
         events.publish(task, "status", "详情采集完成", Map.of("success", successful.size(), "failed", task.collection.failedDetailCount, "progress", 0.62));
-        if (successful.isEmpty()) throw new IllegalStateException("ALL_SELECTED_DETAILS_FAILED");
+        if (successful.isEmpty() && !relevant.isEmpty()) {
+            task.status = TaskStatus.PARTIALLY_COMPLETED;
+            task.failureCode = "ALL_SELECTED_DETAILS_FAILED";
+            task.failureMessage = "入选帖子详情全部读取失败";
+            saveMetrics(task, context);
+            repository.saveTask(task);
+            events.publish(task, "error", "入选帖子详情全部读取失败", Map.of("selected", relevant.size()));
+            return;
+        }
 
         setStage(task, context, "COLLECTING_DETAILS", TaskStatus.EXTRACTING_IMAGES, 0.68);
         List<Post> analyzed = extractImages(task, context, successful, rawImages);
@@ -203,59 +219,166 @@ public class TaskOrchestrator {
         events.publish(task, "done", task.status.name(), Map.of("status", task.status.name()));
     }
 
+    private List<Post> restoreSelectedPosts(Task task) {
+        List<Post> snapshot = repository.selected(task.taskId).orElseGet(() -> {
+            List<String> refs = task.orchestration.checkpoint.selectedPostRefs;
+            if (refs == null || refs.isEmpty()) return List.of();
+            Map<String, Post> candidates = new LinkedHashMap<>();
+            repository.candidates(task.taskId).forEach(p -> candidates.put(p.postRef, p));
+            repository.posts(task.taskId).forEach(p -> candidates.put(p.postRef, p));
+            return refs.stream().map(candidates::get).filter(Objects::nonNull).toList();
+        });
+        Map<String, Post> executed = new HashMap<>();
+        repository.posts(task.taskId).forEach(p -> executed.put(p.postRef, p));
+
+        List<Post> restored = new ArrayList<>();
+        for (Post selected : snapshot) {
+            Post existing = executed.get(selected.postRef);
+            Post base = selected == null ? new Post() : selected;
+            if (existing != null) {
+                // Preserve successful body/OCR or failed attempts while refreshing signed URL and list metrics.
+                existing.url = base.url;
+                existing.xsecToken = base.xsecToken;
+                existing.title = firstNonBlank(existing.title, base.title);
+                existing.likes = firstMetric(existing.likes, base.likes);
+                existing.collections = firstMetric(existing.collections, base.collections);
+                existing.comments = firstMetric(existing.comments, base.comments);
+                restored.add(existing);
+            } else {
+                restored.add(base);
+            }
+        }
+        return restored.stream().filter(p -> p.postRef != null).sorted(Comparator.comparing(p -> p.postRef)).toList();
+    }
+
+    private void finishEmptySearch(Task task, RunContext context) {
+        ReportRecord report = new ReportRecord();
+        report.taskId = task.taskId;
+        report.keyword = task.keyword;
+        report.generatedAt = OffsetDateTime.now();
+        report.scope = "小红书本次搜索返回 " + task.collection.distinctPostCount
+                + " 个不同帖子；相关帖子 0 条，入选 Top 0 条。图片OCR：成功0张，失败0张，记录0张；视频音画未处理。";
+        report.reportMarkdown = """
+                # 关键词研究报告
+
+                ## 1. 范围与限制
+                本次搜索范围内没有找到相关帖子。图片OCR成功0张，失败0张，记录0张；视频音画未处理。
+
+                ## 2. 主要讨论主题
+                本次搜索范围内没有可分析的相关帖子。
+
+                ## 3. 反复出现的观点
+                无相关材料，无法归纳。
+
+                ## 4. 明显分歧
+                无相关材料，无法归纳。
+
+                ## 5. 场景、体验、问题与方法
+                无相关材料，无法归纳。
+
+                ## 6. 证据类型判断
+                无相关材料，无法判断。
+
+                ## 7. 本批材料无法回答的问题
+                本次搜索没有返回相关帖子，因此无法回答研究问题。
+
+                ## 8. 热门帖子列表
+                本次搜索范围内没有相关帖子。
+                """;
+        report.finalAnswerGate = "PASSED";
+        report.failedChecks = List.of();
+        report.citationValidation = Map.of("status", "NOT_APPLICABLE", "invalidCitations", List.of());
+        repository.saveReport(task.taskId, report);
+
+        task.collection.finishedAt = OffsetDateTime.now();
+        task.finishedAt = OffsetDateTime.now();
+        task.status = TaskStatus.COMPLETED;
+        task.orchestration.currentStage = "FINAL_ANSWER_GATE";
+        task.orchestration.lastCompletedStage = "FINAL_ANSWER_GATE";
+        task.orchestration.checkpoint.reportSaved = true;
+        usageTracker.get(task.taskId).finalAnswerGate = "PASSED";
+        saveMetrics(task, context);
+        repository.saveTask(task);
+        events.publish(task, "done", "COMPLETED", Map.of("status", "COMPLETED", "reason", "NO_RELEVANT_POSTS"));
+    }
+
+    private static <T> void addUnique(List<T> list, T value) {
+        if (!list.contains(value)) list.add(value);
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        return a != null && !a.isBlank() ? a : b;
+    }
+
+    private static MetricValue firstMetric(MetricValue a, MetricValue b) {
+        if (a != null && !a.missing) return a;
+        if (b != null && !b.missing) return b;
+        return MetricValue.missing();
+    }
+
     private List<Post> extractImages(Task task, RunContext context, List<Post> posts, Map<String, List<byte[]>> rawImages) {
         List<Post> result = new ArrayList<>();
         for (Post post : posts) {
             context.checkCanceled();
-            List<byte[]> images = new ArrayList<>(rawImages.getOrDefault(post.postRef, List.of()));
-            if (images.isEmpty()) {
-                for (int i = 0; i < post.imageText.size(); i++) {
-                    try {
-                        Path asset = repository.taskDir(task.taskId)
-                                .resolve("attachments/images")
-                                .resolve(imageAssetName(post.postRef, i + 1));
-                        if (java.nio.file.Files.exists(asset)) images.add(java.nio.file.Files.readAllBytes(asset));
-                    } catch (Exception ignored) {}
+            Map<Integer, byte[]> imageBytes = loadImageAssets(task.taskId, post.postRef);
+            List<byte[]> raw = rawImages.getOrDefault(post.postRef, List.of());
+            for (int i = 0; i < raw.size(); i++) imageBytes.put(i + 1, raw.get(i));
+
+            if (post.imageText.isEmpty()) {
+                for (Integer index : new TreeSet<>(imageBytes.keySet())) {
+                    ImageText pending = new ImageText();
+                    pending.imageIndex = index;
+                    pending.sourceUrl = post.url;
+                    pending.status = "PENDING";
+                    post.imageText.add(pending);
                 }
             }
-            if (post.imageText.isEmpty() && images.isEmpty()) {
-                post.coverage = new ArrayList<>(new LinkedHashSet<>(post.coverage));
-                updateImageCoverageNote(post);
-                repository.savePost(task.taskId, post); result.add(post);
-                continue;
-            }
-            List<ImageText> extracted = new ArrayList<>();
-            // Details are saved with pending image records only when they were newly collected.
-            // Cached posts already contain their extracted text.
-            if (post.imageText.stream().allMatch(x -> !"PENDING".equals(x.status))) {
-                updateImageCoverageNote(post);
-                repository.savePost(task.taskId, post); result.add(post); context.cacheHits++; continue;
-            }
-            post.imageText = new ArrayList<>();
-            for (int i = 0; i < images.size(); i++) {
-                ImageText pending = new ImageText();
-                pending.imageIndex = i + 1; pending.sourceUrl = post.url; pending.status = "PENDING";
-                post.imageText.add(pending);
-            }
+
             for (ImageText pending : post.imageText) {
+                if (!"PENDING".equals(pending.status)) continue;
+                byte[] png = imageBytes.get(pending.imageIndex);
+                if (png == null) {
+                    pending.status = "FAILED";
+                    pending.failureReason = "IMAGE_ASSET_MISSING";
+                    continue;
+                }
                 try {
-                    byte[] png = images.get(pending.imageIndex - 1);
                     ModelService.ImageTextResult r = modelService.extractImageText(task.taskId,
                             post.postRef + "-" + pending.imageIndex, png);
-                    pending.text = r.text(); pending.confidence = r.confidence(); pending.status = "SUCCESS";
+                    pending.text = r.text();
+                    pending.confidence = r.confidence();
+                    pending.status = "SUCCESS";
+                    pending.failureReason = null;
                     usageTracker.get(task.taskId).toolCalls.incrementAndGet();
                 } catch (Exception e) {
-                    pending.status = "FAILED"; pending.failureReason = e.getMessage();
+                    pending.status = "FAILED";
+                    pending.failureReason = e.getMessage();
                 }
-                extracted.add(pending);
             }
-            post.imageText = extracted;
+
             post.coverage = new ArrayList<>(new LinkedHashSet<>(post.coverage));
-            if (extracted.stream().anyMatch(x -> "SUCCESS".equals(x.status) && x.text != null && !x.text.isBlank())) post.coverage.add("IMAGE_TEXT");
+            if (post.imageText.stream().anyMatch(x -> "SUCCESS".equals(x.status) && x.text != null && !x.text.isBlank())) {
+                post.coverage.add("IMAGE_TEXT");
+            }
             updateImageCoverageNote(post);
             repository.savePost(task.taskId, post);
             if (hasRealDetail(post)) repository.saveCachePost(post);
             result.add(post);
+        }
+        return result;
+    }
+
+    private Map<Integer, byte[]> loadImageAssets(String taskId, String postRef) {
+        Map<Integer, byte[]> result = new HashMap<>();
+        for (int index = 1; index <= 99; index++) {
+            try {
+                Path asset = repository.taskDir(taskId)
+                        .resolve("attachments")
+                        .resolve(imageAssetName(postRef, index));
+                if (Files.exists(asset)) result.put(index, Files.readAllBytes(asset));
+            } catch (Exception ignored) {
+                // A missing/unreadable asset is recorded on the ImageText row, never silently dropped.
+            }
         }
         return result;
     }

@@ -45,6 +45,8 @@ public class ReportAgent {
         }
 
         StringBuilder report = new StringBuilder();
+        StringBuilder streamedDraft = new StringBuilder();
+        boolean degraded = false;
         String system = """
                 You are a careful Chinese research analyst. Write a Markdown report using ONLY supplied post evidence.
                 Required sections, in this order:
@@ -73,21 +75,31 @@ public class ReportAgent {
                 "\n\nSelected evidence by query:\n" + selected + "\n\nFull evidence packs:\n" + evidence;
         try {
             modelService.synthesizeReport(task.taskId, system, prompt, token -> {
-                report.append(token);
+                streamedDraft.append(token);
                 tokens.accept(token);
             });
+            // Only a successfully finished stream is allowed to become the canonical report.
+            report.append(streamedDraft);
         } catch (Exception e) {
+            streamedDraft.setLength(0);
             if (!properties.getModel().isAllowOfflineFallback()) throw e;
+            degraded = true;
             String offline = offlineReport(task, posts);
             report.append(offline);
+            tokens.accept("\n\n> 模型流式生成失败，已切换为保守降级报告。\n\n");
             tokens.accept(offline);
         }
 
         List<String> failures = gate(report.toString(), posts);
+        if (degraded) failures.add("MODEL_SYNTHESIS_DEGRADED");
         int repairs = 0;
-        while (!failures.isEmpty() && repairs < properties.getModel().getMaxFinalRepairs()) {
+        while (!degraded && !failures.isEmpty() && repairs < properties.getModel().getMaxFinalRepairs()) {
             String original = report.toString();
             String repaired = modelService.repairReport(task.taskId, original, failures, evidence);
+            if (repaired == null || repaired.isBlank()) {
+                failures.add("REPORT_REPAIR_FAILED");
+                break;
+            }
             report.setLength(0);
             report.append(repaired);
             repairs++;
@@ -102,7 +114,11 @@ public class ReportAgent {
         record.agentTrace = trace;
         record.failedChecks = failures;
         record.finalAnswerGate = failures.isEmpty() ? "PASSED" : "FAILED";
-        record.citationValidation = Map.of("status", failures.isEmpty() ? "PASSED" : "FAILED", "invalidCitations", invalidCitations(report.toString(), posts));
+        List<String> unsupportedClaims = unsupportedClaims(report.toString(), posts);
+        record.citationValidation = Map.of(
+                "status", failures.isEmpty() ? "PASSED" : "FAILED",
+                "invalidCitations", invalidCitations(report.toString(), posts),
+                "unsupportedClaims", unsupportedClaims);
         var u = usageTracker.get(task.taskId);
         record.modelUsage = Map.of("calls", u.calls.get(), "agentLoopRounds", u.agentRounds.get(),
                 "toolCalls", u.toolCalls.get(), "inputTokens", u.inputTokens.get(), "outputTokens", u.outputTokens.get(),
@@ -184,7 +200,78 @@ public class ReportAgent {
         if (invalidCitations(report, posts).isEmpty() && !Pattern.compile("\\[P\\d{3}\\]").matcher(report).find())
             failures.add("缺少 postRef 引用");
         failures.addAll(invalidCitations(report, posts).stream().map(x -> "无效引用: " + x).toList());
+        failures.addAll(unsupportedClaims(report, posts));
         return failures;
+    }
+
+    private List<String> unsupportedClaims(String report, List<Post> posts) {
+        List<String> failures = new ArrayList<>();
+        Map<String, Post> byRef = new HashMap<>();
+        posts.forEach(p -> byRef.put(p.postRef, p));
+        Pattern citation = Pattern.compile("\\[(P\\d{3})\\]");
+
+        for (String rawLine : report.split("\\r?\\n")) {
+            String line = rawLine == null ? "" : rawLine.trim();
+            if (line.isBlank() || line.startsWith("#") || line.contains("](http")) continue;
+            Matcher matcher = citation.matcher(line);
+            List<String> refs = new ArrayList<>();
+            while (matcher.find()) refs.add(matcher.group(1));
+            if (refs.isEmpty()) continue;
+
+            StringBuilder evidence = new StringBuilder();
+            for (String ref : refs) {
+                Post post = byRef.get(ref);
+                if (post != null) evidence.append(post.evidenceText()).append('\n');
+            }
+            String claim = line.replaceAll("\\[(?:P\\d{3})\\]", "")
+                    .replaceAll("\\[[^]]+\\]\\([^)]+\\)", "")
+                    .replaceAll("[#*`>]", " ");
+            Set<String> claimTokens = significantTokens(claim);
+            Set<String> evidenceTokens = significantTokens(evidence.toString());
+            if (claimTokens.isEmpty()) continue;
+
+            Set<String> numbers = numbers(claim);
+            for (String number : numbers) {
+                if (!evidenceTokens.contains(number)) {
+                    failures.add("结论数值无证据支持: " + truncate(claim, 80));
+                    break;
+                }
+            }
+
+            long supportedCount = claimTokens.stream().filter(evidenceTokens::contains).count();
+            int required = Math.min(2, claimTokens.size());
+            if (supportedCount < required) {
+                failures.add("结论缺乏原文证据支持: " + truncate(claim, 80));
+            }
+        }
+        return failures.stream().distinct().toList();
+    }
+
+    private Set<String> significantTokens(String text) {
+        String normalized = text == null ? "" : text.toLowerCase(Locale.ROOT);
+        Set<String> tokens = new HashSet<>();
+        Matcher english = Pattern.compile("[a-z][a-z0-9_-]{1,}").matcher(normalized);
+        while (english.find()) tokens.add(english.group());
+        Matcher numbers = Pattern.compile("\\d+(?:\\.\\d+)?").matcher(normalized);
+        while (numbers.find()) tokens.add(numbers.group());
+        Matcher chinese = Pattern.compile("[\\u4e00-\\u9fff]{2,}").matcher(normalized);
+        Set<String> generic = Set.of("多个", "帖子", "文章", "作者", "认为", "提到", "讨论", "主要", "相关",
+                "明显", "存在", "可以", "无法", "没有", "通过", "进行", "以及", "同时", "部分", "用户");
+        while (chinese.find()) {
+            String value = chinese.group();
+            for (int i = 0; i + 2 <= value.length(); i++) {
+                String token = value.substring(i, i + 2);
+                if (!generic.contains(token)) tokens.add(token);
+            }
+        }
+        return tokens;
+    }
+
+    private Set<String> numbers(String text) {
+        Set<String> result = new HashSet<>();
+        Matcher matcher = Pattern.compile("\\d+(?:\\.\\d+)?").matcher(text == null ? "" : text);
+        while (matcher.find()) result.add(matcher.group());
+        return result;
     }
 
     private List<String> invalidCitations(String report, List<Post> posts) {
